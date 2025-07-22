@@ -1,17 +1,34 @@
+# Configure the AWS provider
 provider "aws" {
   region = local.region
 }
 
+# Retrieve information about the current AWS identity
 data "aws_caller_identity" "current" {}
 
+# List available AWS Availability Zones (exclude local zones)
 data "aws_availability_zones" "available" {
-  # Do not include local zones
   filter {
     name   = "opt-in-status"
     values = ["opt-in-not-required"]
   }
 }
 
+# EIP for NAT Gateway (to whitelist egress)
+data "aws_eip" "nat" {
+  depends_on = [module.vpc]
+
+  filter {
+    name   = "tag:Blueprint"
+    values = [local.name]
+  }
+  filter {
+    name   = "domain"
+    values = ["vpc"]
+  }
+}
+
+# Configure the Helm provider to talk to the EKS clusterss
 provider "helm" {
   kubernetes {
     host                   = module.eks.cluster_endpoint
@@ -38,20 +55,31 @@ provider "kubernetes" {
   }
 }
 
+# Define local variables for reuse throughout the configuration
 locals {
-  name   = "eks-gitops"
-  region = var.region
-
+  name            = "eks-gitops"
+  region          = var.region
   cluster_version = var.kubernetes_version
 
   vpc_cidr = var.vpc_cidr
   azs      = slice(data.aws_availability_zones.available.names, 0, 3)
 
+  # Build a list of allowed CIDRs, dropping any empty entries
+  endpoint_cidrs = [
+    for cidr in [
+      var.local_ip,                      # For tests purpose (placeholder)
+      "${data.aws_eip.nat.public_ip}/32" # NAT Gateway EIP
+    ] : cidr
+    if cidr != "" # only include non-empty values
+  ]
+
+  # URL and paths for the GitOps addons repository
   gitops_addons_url      = "${var.gitops_addons_org}/${var.gitops_addons_repo}"
   gitops_addons_basepath = var.gitops_addons_basepath
   gitops_addons_path     = var.gitops_addons_path
   gitops_addons_revision = var.gitops_addons_revision
 
+  # URL and paths for the GitOps workload repository
   gitops_workload_url      = "${var.gitops_workload_org}/${var.gitops_workload_repo}"
   gitops_workload_basepath = var.gitops_workload_basepath
   gitops_workload_path     = var.gitops_workload_path
@@ -107,6 +135,7 @@ locals {
     { aws_cluster_name = module.eks.cluster_name }
   )
 
+  # Metadata passed to the GitOps bootstrap module
   addons_metadata = merge(
     module.eks_blueprints_addons.gitops_metadata,
     {
@@ -129,14 +158,15 @@ locals {
     }
   )
 
+  # Common tags applied to all resources
   tags = {
     Blueprint  = local.name
-    GithubRepo = "github.com/aws-ia/terraform-aws-eks-blueprints"
+    GithubRepo = "github.com/0x1v4n/eks-gitops"
   }
 }
 
 ################################################################################
-# GitOps Bridge: Bootstrap
+# GitOps Bridge: Bootstrap Argo CD into the cluster
 ################################################################################
 module "gitops_bridge_bootstrap" {
   source = "github.com/gitops-bridge-dev/gitops-bridge-argocd-bootstrap-terraform?ref=v2.0.0"
@@ -183,28 +213,33 @@ module "eks_blueprints_addons" {
 }
 
 ################################################################################
-# EKS Cluster
+# Create the EKS Cluster
 ################################################################################
-
 module "eks" {
   source  = "terraform-aws-modules/eks/aws"
   version = "~> 19.13"
 
-  cluster_name                   = local.name
-  cluster_version                = local.cluster_version
-  cluster_endpoint_public_access = true
+  cluster_name                    = local.name
+  cluster_version                 = local.cluster_version
+  cluster_endpoint_public_access  = true
+  cluster_endpoint_private_access = false
+
+  # Restrict public API access: include local IP if provided, plus NAT Gateway EIP
+  cluster_endpoint_public_access_cidrs = local.endpoint_cidrs
 
   vpc_id     = module.vpc.vpc_id
   subnet_ids = module.vpc.private_subnets
 
+  # Define a managed node group
   eks_managed_node_groups = {
     initial = {
-      instance_types = ["m5.large"]
+      instance_types = ["t3.large"]
 
       min_size     = 1
       max_size     = 3
       desired_size = 2
 
+      # Attach an encrypted 20 GiB gp3 root volume
       block_device_mappings = [{
         device_name = "/dev/xvda"
         ebs = {
@@ -216,7 +251,8 @@ module "eks" {
       }]
     }
   }
-  # EKS Addons
+
+  # Core EKS addons configuration
   cluster_addons = {
     coredns    = {}
     kube-proxy = {}
@@ -239,7 +275,37 @@ module "eks" {
 }
 
 ################################################################################
-# Supporting Resources
+# VPC Interface Endpoints for AWS Systems Manager (SSM) and EC2 Messages
+################################################################################
+resource "aws_vpc_endpoint" "ssm" {
+  vpc_id              = module.vpc.vpc_id
+  service_name        = "com.amazonaws.${local.region}.ssm"
+  vpc_endpoint_type   = "Interface"
+  subnet_ids          = module.vpc.private_subnets
+  security_group_ids  = [module.eks.node_security_group_id]
+  private_dns_enabled = true
+}
+
+resource "aws_vpc_endpoint" "ec2messages" {
+  vpc_id              = module.vpc.vpc_id
+  service_name        = "com.amazonaws.${local.region}.ec2messages"
+  vpc_endpoint_type   = "Interface"
+  subnet_ids          = module.vpc.private_subnets
+  security_group_ids  = [module.eks.node_security_group_id]
+  private_dns_enabled = true
+}
+
+resource "aws_vpc_endpoint" "ssmmessages" {
+  vpc_id              = module.vpc.vpc_id
+  service_name        = "com.amazonaws.${local.region}.ssmmessages"
+  vpc_endpoint_type   = "Interface"
+  subnet_ids          = module.vpc.private_subnets
+  security_group_ids  = [module.eks.node_security_group_id]
+  private_dns_enabled = true
+}
+
+################################################################################
+# VPC Module: networks, subnets, and NAT gateway
 ################################################################################
 module "vpc" {
   source  = "terraform-aws-modules/vpc/aws"
@@ -264,4 +330,163 @@ module "vpc" {
   }
 
   tags = local.tags
+}
+
+################################################################################
+# Bastion EC2 Instance
+################################################################################
+resource "aws_instance" "bastion" {
+  ami                         = data.aws_ami.amazon_linux.id
+  instance_type               = "t3.micro"
+  subnet_id                   = module.vpc.public_subnets[0]
+  associate_public_ip_address = true
+  vpc_security_group_ids      = [aws_security_group.bastion_sg.id]
+  iam_instance_profile        = aws_iam_instance_profile.bastion_profile.name
+
+  # Bootstrap script to install SSM agent and configure AWS CLI
+  user_data = templatefile("${path.module}/bastion.sh.tpl", {
+    cluster_name = local.name
+    region       = local.region
+  })
+
+  root_block_device {
+    volume_size = 8
+    encrypted   = true
+  }
+
+  tags = { Name = "${local.name}-bastion" }
+}
+
+# Create the IAM instance profile for bastion
+resource "aws_iam_instance_profile" "bastion_profile" {
+  name = "${local.name}-bastion-profile"
+  role = aws_iam_role.bastion_ssm_role.name
+}
+
+# Fetch the latest Amazon Linux 2 AMI
+data "aws_ami" "amazon_linux" {
+  most_recent = true
+  owners      = ["amazon"]
+
+  filter {
+    name   = "name"
+    values = ["amzn2-ami-hvm-*-x86_64-gp2"]
+  }
+}
+
+################################################################################
+# Bastion Host IAM Role and Policies
+################################################################################
+resource "aws_iam_role" "bastion_ssm_role" {
+  name = "${local.name}-bastion-ssm-role"
+
+  assume_role_policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Action = "sts:AssumeRole"
+      Effect = "Allow"
+      Principal = {
+        Service = "ec2.amazonaws.com"
+      }
+    }]
+  })
+}
+
+resource "aws_iam_role_policy_attachment" "bastion_ssm_managed_instance_core" {
+  role       = aws_iam_role.bastion_ssm_role.name
+  policy_arn = "arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore"
+}
+
+################################################################################
+# Security Group for Bastion Host
+################################################################################
+resource "aws_security_group" "bastion_sg" {
+  name   = "${local.name}-bastion-sg"
+  vpc_id = module.vpc.vpc_id
+
+  tags = {
+    Name = "${local.name}-bastion-sg"
+  }
+}
+
+# Allow outbound HTTPS from bastion
+resource "aws_security_group_rule" "bastion_egress_https" {
+  type              = "egress"
+  from_port         = 443
+  to_port           = 443
+  protocol          = "tcp"
+  cidr_blocks       = ["0.0.0.0/0"]
+  security_group_id = aws_security_group.bastion_sg.id
+}
+
+
+# Allow outbound to Argo CD NodePort range inside the VPC
+resource "aws_security_group_rule" "bastion_egress_argo_nodeport" {
+  type              = "egress"
+  from_port         = 32080
+  to_port           = 32080
+  protocol          = "tcp"
+  cidr_blocks       = ["10.0.0.0/16"]
+  security_group_id = aws_security_group.bastion_sg.id
+}
+
+################################################################################
+# Ingress Rules: Bastion -> Cluster and Endpoints
+################################################################################
+# Allow bastion to reach the EKS API server
+resource "aws_security_group_rule" "bastion_to_api_https" {
+  type                     = "ingress"
+  protocol                 = "tcp"
+  from_port                = 443
+  to_port                  = 443
+  source_security_group_id = aws_security_group.bastion_sg.id
+  security_group_id        = module.eks.cluster_security_group_id
+  description              = "Bastion to EKS API"
+}
+
+# Allow bastion to call SSM interface endpoints
+resource "aws_security_group_rule" "endpoint_from_bastion_https" {
+  description              = "Allow bastion to reach VPC Interface Endpoints (SSM)"
+  type                     = "ingress"
+  protocol                 = "tcp"
+  from_port                = 443
+  to_port                  = 443
+  security_group_id        = module.eks.node_security_group_id
+  source_security_group_id = aws_security_group.bastion_sg.id
+}
+
+# Allow bastion to reach Argo CD NodePort on worker nodes
+resource "aws_security_group_rule" "bastion_to_nodes_argo" {
+  type                     = "ingress"
+  protocol                 = "tcp"
+  from_port                = 32080
+  to_port                  = 32080
+  source_security_group_id = aws_security_group.bastion_sg.id
+  security_group_id        = module.eks.node_security_group_id
+  description              = "Bastion to ArgoCD NodePort"
+}
+
+################################################################################
+# Additional Game NodePort Rules
+################################################################################
+# Ingress: bastion -> game-2048 service
+resource "aws_security_group_rule" "bastion_to_game_nodeport" {
+  description              = "Allow bastion to access game-2048 NodePort"
+  type                     = "ingress"
+  protocol                 = "tcp"
+  from_port                = 31427
+  to_port                  = 31427
+  security_group_id        = module.eks.node_security_group_id
+  source_security_group_id = aws_security_group.bastion_sg.id
+}
+
+# Egress: bastion -> game-2048 service
+resource "aws_security_group_rule" "bastion_egress_game_nodeport" {
+  description       = "Allow bastion to reach game-2048 NodePort on nodes"
+  type              = "egress"
+  protocol          = "tcp"
+  from_port         = 31427
+  to_port           = 31427
+  security_group_id = aws_security_group.bastion_sg.id
+  cidr_blocks       = ["10.0.0.0/16"]
 }

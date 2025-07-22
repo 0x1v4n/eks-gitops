@@ -13,12 +13,12 @@ terraform -chdir=$SCRIPTDIR output -raw configure_kubectl > "$TMPFILE"
 if [[ ! $(cat $TMPFILE) == *"No outputs found"* ]]; then
   source "$TMPFILE"
   kubectl delete -n argocd applicationset workloads
-  echo "Deleting ingress/svc for game-2048, takes a few minutes for Load Balancer to be deleted"
-  kubectl delete -n game-2048 ing game-2048
+  # echo "Deleting ingress/svc for game-2048, takes a few minutes for Load Balancer to be deleted"
+  # kubectl delete -n game-2048 ing game-2048
   kubectl delete -n argocd applicationset cluster-addons
   kubectl delete -n argocd applicationset addons-argocd
-  echo "Deleting ingress/svc for argo-cd-argocd-server, takes a few minutes for Load Balancer to be deleted"
-  kubectl delete -n argocd svc argo-cd-argocd-server
+  # echo "Deleting ingress/svc for argo-cd-argocd-server, takes a few minutes for Load Balancer to be deleted"
+  # kubectl delete -n argocd svc argo-cd-argocd-server
 fi
 
 terraform destroy -target="module.gitops_bridge_bootstrap" -auto-approve

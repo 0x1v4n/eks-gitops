@@ -6,17 +6,6 @@ This tutorial guides you through deploying an Amazon EKS cluster with addons con
 
 The [GitOps Bridge Pattern](https://github.com/gitops-bridge-dev) enables Kubernetes administrators to utilize Infrastructure as Code (IaC) and GitOps tools for deploying Kubernetes Addons and Workloads. Addons often depend on Cloud resources that are external to the cluster. The configuration metadata for these external resources is required by the Addons' Helm charts. While IaC is used to create these cloud resources, it is not used to install the Helm charts. Instead, the IaC tool stores this metadata either within GitOps resources in the cluster or in a Git repository. The GitOps tool then extracts these metadata values and passes them to the Helm chart during the Addon installation process. This mechanism forms the bridge between IaC and GitOps, hence the term "GitOps Bridge."
 
-Additional examples available on the [GitOps Bridge Pattern](https://github.com/gitops-bridge-dev):
-
-- [argocd-ingress](https://github.com/gitops-bridge-dev/gitops-bridge/tree/main/argocd/iac/terraform/examples/eks/argocd-ingress)
-- [aws-secrets-manager](https://github.com/gitops-bridge-dev/gitops-bridge/tree/main/argocd/iac/terraform/examples/eks/aws-secrets-manager)
-- [crossplane](https://github.com/gitops-bridge-dev/gitops-bridge/tree/main/argocd/iac/terraform/examples/eks/crossplane)
-- [external-secrets](https://github.com/gitops-bridge-dev/gitops-bridge/tree/main/argocd/iac/terraform/examples/eks/external-secrets)
-- [multi-cluster/distributed](https://github.com/gitops-bridge-dev/gitops-bridge/tree/main/argocd/iac/terraform/examples/eks/multi-cluster/distributed)
-- [multi-cluster/hub-spoke](https://github.com/gitops-bridge-dev/gitops-bridge/tree/main/argocd/iac/terraform/examples/eks/multi-cluster/hub-spoke)
-- [multi-cluster/hub-spoke-shared](https://github.com/gitops-bridge-dev/gitops-bridge/tree/main/argocd/iac/terraform/examples/eks/multi-cluster/hub-spoke-shared)
-- [private-git](https://github.com/gitops-bridge-dev/gitops-bridge/tree/main/argocd/iac/terraform/examples/eks/private-git)
-
 ## Prerequisites
 
 Before you begin, make sure you have the following command line tools installed:
@@ -51,7 +40,7 @@ The expected output will have two lines you run in your terminal
 
 ```text
 export KUBECONFIG="/tmp/eks-gitops"
-aws eks --region eu-west-1 update-kubeconfig --name eks-gitops
+aws eks --region eu-west-1 update-kubeconfig --name eks-gitops --profile mfa
 ```
 
 >The first line sets the `KUBECONFIG` environment variable to a temporary file
@@ -77,9 +66,6 @@ The output looks like the following:
   "addons_repo_url": "https://github.com/0x1v4n/eks-addons",
   "aws_account_id": "0123456789",
   "aws_cluster_name": "eks-gitops",
-  "aws_load_balancer_controller_iam_role_arn": "arn:aws:iam::0123456789:role/alb-controller",
-  "aws_load_balancer_controller_namespace": "kube-system",
-  "aws_load_balancer_controller_service_account": "aws-load-balancer-controller-sa",
   "aws_region": "eu-west-1",
   "aws_vpc_id": "vpc-001d3f00151bbb731",
   "cluster_name": "in-cluster",
@@ -104,9 +90,9 @@ The output looks like the following:
   "argocd.argoproj.io/secret-type": "cluster",
   "aws_cluster_name": "eks-gitops",
   "cluster_name": "in-cluster",
+  "enable_argo_rollouts": "true",
   "enable_argocd": "true",
-  "enable_aws_load_balancer_controller": "true",
-  "enable_metrics_server": "true",
+  "enable_kube_prometheus_stack": "true",
   "environment": "dev",
   "kubernetes_version": "1.28"
 }
@@ -133,11 +119,10 @@ kubectl get applications -n argocd -w
 The expected output should look like the following:
 
 ```text
-NAME                                            SYNC STATUS   HEALTH STATUS
-addon-in-cluster-argo-cd                        Synced        Healthy
-addon-in-cluster-aws-load-balancer-controller   Synced        Healthy
-addon-in-cluster-metrics-server                 Synced        Healthy
-cluster-addons                                  Synced        Healthy
+NAME                                     SYNC STATUS   HEALTH STATUS
+addon-in-cluster-argo-cd                 Synced        Healthy
+addon-in-cluster-argo-rollouts           Synced        Healthy
+cluster-addons                           Synced        Healthy
 ```
 
 ### Verify the Addons
@@ -145,9 +130,6 @@ cluster-addons                                  Synced        Healthy
 Verify that the addons are ready:
 
 ```shell
-kubectl get deployment -n kube-system \
-  aws-load-balancer-controller \
-  metrics-server
 kubectl get deploy -n argocd \
   argo-cd-argocd-applicationset-controller \
   argo-cd-argocd-repo-server \
@@ -158,8 +140,6 @@ The expected output should look like the following:
 
 ```text
 NAME                                       READY   UP-TO-DATE   AVAILABLE   AGE
-aws-load-balancer-controller               2/2     2            2           7m21s
-metrics-server                             1/1     1            1           7m41s
 argo-cd-argocd-applicationset-controller   1/1     1            1           109m
 argo-cd-argocd-repo-server                 1/1     1            1           109m
 argo-cd-argocd-server                      1/1     1            1           109m
@@ -174,13 +154,28 @@ run the commands shown in the Terraform output as the example below:
 terraform output -raw access_argocd
 ```
 
-The expected output should contain the `kubectl` config followed by `kubectl` command to retrieve
-the URL, username, password to login into ArgoCD UI or CLI.
+The expected output should contain the config to retrieve the URL, username, password to login into ArgoCD UI.
 
 ```text
 echo "ArgoCD Username: admin"
 echo "ArgoCD Password: $(kubectl get secrets argocd-initial-admin-secret -n argocd --template="{{index .data.password | base64decode}}")"
-echo "ArgoCD URL: https://$(kubectl get svc -n argocd argo-cd-argocd-server -o jsonpath='{.status.loadBalancer.ingress[0].hostname}')"
+
+export REGION="eu-west-1"
+export PROFILE="mfa"
+export INSTANCE_ID="i-06480eadb1cfd9d3d"
+export ARGOCD_NODE_IP=$(kubectl get pod -n argocd \
+  -l app.kubernetes.io/name=argocd-server \
+  -o jsonpath='{.items[0].status.hostIP}')
+
+To open the SSM port-forwarding tunnel to ArgoCD:
+aws ssm start-session \
+  --target "$INSTANCE_ID" \
+  --document-name AWS-StartPortForwardingSessionToRemoteHost \
+  --parameters "{\"host\":[\"$ARGOCD_NODE_IP\"],\"portNumber\":[\"32080\"],\"localPortNumber\":[\"8080\"]}" \
+  --region "$REGION" \
+  --profile "$PROFILE"
+
+Then access ArgoCD at: http://localhost:8080
 ```
 
 ## Deploy the Workloads
@@ -197,7 +192,7 @@ Wait until all the ArgoCD applications' `HEALTH STATUS` is `Healthy`.
 Use `Ctrl+C` or `Cmd+C` to exit the `watch` command. ArgoCD Applications
 can take a couple of minutes in order to achieve the Healthy status.
 
-```shell
+```shells
 watch kubectl get -n argocd applications workloads
 ```
 
@@ -213,110 +208,65 @@ workloads   Synced        Healthy
 Verify that the application configuration is present and the pod is running:
 
 ```shell
-kubectl get -n game-2048 deployments,service,ep,ingress
+kubectl get -n game-2048 deployments,service,ep
 ```
 
 The expected output should look like the following:
 
 ```text
 NAME                        READY   UP-TO-DATE   AVAILABLE   AGE
-deployment.apps/game-2048   1/1     1            1           7h59m
+deployment.apps/game-2048   1/1     1            1           2m9s
 
-NAME                TYPE        CLUSTER-IP      EXTERNAL-IP   PORT(S)   AGE
-service/game-2048   ClusterIP   172.20.155.47   <none>        80/TCP    7h59m
+NAME                TYPE       CLUSTER-IP       EXTERNAL-IP   PORT(S)        AGE
+service/game-2048   NodePort   172.20.118.252   <none>        80:31427/TCP   2m9s
 
-NAME                  ENDPOINTS       AGE
-endpoints/game-2048   10.0.13.64:80   7h59m
-
-NAME                CLASS   HOSTS   ADDRESS                              PORTS   AGE
-ingress/game-2048   alb     *       k8s-<>.eu-west-1.elb.amazonaws.com   80      7h59m
+NAME                  ENDPOINTS        AGE
+endpoints/game-2048   10.0.13.227:80   2m9s
 ```
 
-AWS Load Balancer can take a couple of minutes in order to be created.
+### Access the Application Using AWS SSM Port Forwarding
 
-Run the following command and wait until and event for ingress `game-2048` contains `Successfully reconciled`.
-Use `Ctrl+C` or `Cmd+C`to exit the `watch` command.
+Reach the NodePort service through an AWS SSM port-forwarding session.
+
+#### Prerequisites
+
+- **`$INSTANCE_ID`**: ID of the EC2 instance running in the public subnet.
+- **`$APP_NODE_IP`**: Private IP of the Kubernetes node where the game pod is scheduled.
+- **`$REGION`**: AWS region (e.g., eu-west-1). 
+- **`$PROFILE`**: Your AWS CLI profile name. 
+
+To get the private node IP hosting the game-2048 pod, run:
 
 ```shell
-kubectl events -n game-2048 --for ingress/game-2048 --watch
+kubectl get pod -n game-2048 -o wide
 ```
 
-The expected output should look like the following:
+You’ll see output like:
 
 ```text
-LAST SEEN   TYPE     REASON                   OBJECT              MESSAGE
-11m         Normal   SuccessfullyReconciled   Ingress/game-2048   Successfully reconciled
+NAME                         READY   STATUS    RESTARTS   AGE   IP           NODE
+game-2048-66fb78b995-jnstq   1/1     Running   0          15m   10.0.27.49   ip-10-0-27-29.eu-west-1.compute.internal
 ```
 
-### Access the Application using AWS Load Balancer
-
-Verify the application endpoint health using `wget`:
+Then extract the NODE name and resolve its internal IP with:
 
 ```shell
-kubectl exec -n game-2048 deploy/game-2048 -- \
-wget -S --spider $(kubectl get -n game-2048 ingress game-2048 -o jsonpath='{.status.loadBalancer.ingress[0].hostname}')
+export APP_NODE_IP=$(kubectl get pod -n game-2048 \
+  -l app.kubernetes.io/name=game-2048 \
+  -o jsonpath='{.items[0].status.hostIP}')
 ```
 
-The expected output should look like the following:
-
-```text
-  HTTP/1.1 200 OK
-  Date: Wed, 01 Nov 2023 22:44:57 GMT
-  Content-Type: text/html
-  Content-Length: 3988
-```
-
->A success response should contain `HTTP/1.1 200 OK`.
-
-Retrieve the ingress URL to access the application in your local web browser.
+#### Start the port-forwarding session
 
 ```shell
-echo "Application URL: http://$(kubectl get -n game-2048 ingress game-2048 -o jsonpath='{.status.loadBalancer.ingress[0].hostname}')"
+aws ssm start-session \
+  --target "$INSTANCE_ID" \
+  --document-name AWS-StartPortForwardingSessionToRemoteHost \
+  --parameters "{\"host\":[\"$APP_NODE_IP\"],\"portNumber\":[\"31427\"],\"localPortNumber\":[\"8081\"]}" \
+  --region "$REGION" \
+  --profile "$PROFILE"
 ```
-
-### Container Metrics
-
-Check the application's CPU and memory metrics:
-
-```shell
-kubectl top pods -n game-2048
-```
-
-The expected output should look like the following:
-
-```text
-NAME                         CPU(cores)   MEMORY(bytes)
-game-2048-66fb78b995-h1bjv   1m           2Mi
-```
-
-Check the CPU and memory metrics for all pods for Addons and Workloads:
-
-```shell
-kubectl top pods -A
-```
-
-The expected output should look like the following:
-
-```text
-NAMESPACE     NAME                                                        CPU(cores)   MEMORY(bytes)
-argocd        argo-cd-argocd-application-controller-0                     43m          138Mi
-argocd        argo-cd-argocd-applicationset-controller-5db688844c-79skp   1m           25Mi
-argocd        argo-cd-argocd-dex-server-cd48d7bc-x7flf                    1m           16Mi
-argocd        argo-cd-argocd-notifications-controller-7d7ccc6b9d-dg9r6    1m           17Mi
-argocd        argo-cd-argocd-redis-7f89c69877-6m2cj                       2m           3Mi
-argocd        argo-cd-argocd-repo-server-644b9b5668-m9ddg                 8m           62Mi
-argocd        argo-cd-argocd-server-57cbbd6f94-lp4wx                      2m           26Mi
-game-2048     game-2048-66fb78b995-h1bjv                                  1m           2Mi
-kube-system   aws-load-balancer-controller-8488df87c-4nxv6                2m           26Mi
-kube-system   aws-load-balancer-controller-8488df87c-zs4p6                1m           19Mi
-kube-system   aws-node-ck6vq                                              3m           57Mi
-kube-system   aws-node-fv2sg                                              3m           56Mi
-kube-system   coredns-59754897cf-5r2xp                                    1m           13Mi
-kube-system   coredns-59754897cf-fn7jb                                    1m           13Mi
-kube-system   kube-proxy-lz2dc                                            1m           11Mi
-kube-system   kube-proxy-pd2lm                                            1m           12Mi
-kube-system   metrics-server-5b76987ff-5g1sv                              4m           17Mi
-```
+Once the session is active, open your browser at: [http://localhost:8081](http://localhost:8081)
 
 ## Destroy the EKS Cluster
 
