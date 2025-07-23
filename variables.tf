@@ -22,9 +22,9 @@ variable "addons" {
   description = "Kubernetes addons"
   type        = any
   default = {
-    enable_argocd                       = true
-    enable_argo_rollouts                = true
-    enable_kube_prometheus_stack        = true
+    enable_argocd                = true
+    enable_argo_rollouts         = true
+    enable_kube_prometheus_stack = true
   }
 }
 variable "local_ip" {
