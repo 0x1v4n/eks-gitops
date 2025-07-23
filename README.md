@@ -62,7 +62,7 @@ The output looks like the following:
 {
   "addons_repo_basepath": "argocd/",
   "addons_repo_path": "bootstrap/control-plane/addons",
-  "addons_repo_revision": "main",
+  "addons_repo_revision": "dev",
   "addons_repo_url": "https://github.com/0x1v4n/eks-addons",
   "aws_account_id": "0123456789",
   "aws_cluster_name": "eks-gitops",
@@ -72,7 +72,7 @@ The output looks like the following:
   "environment": "dev",
   "workload_repo_basepath": "",
   "workload_repo_path": "k8s",
-  "workload_repo_revision": "main",
+  "workload_repo_revision": "dev",
   "workload_repo_url": "https://github.com/0x1v4n/eks-gitops"
 }
 ```
@@ -208,14 +208,14 @@ workloads   Synced        Healthy
 Verify that the application configuration is present and the pod is running:
 
 ```shell
-kubectl get -n game-2048 deployments,service,ep
+kubectl get -n game-2048 rollout,service,ep
 ```
 
 The expected output should look like the following:
 
 ```text
-NAME                        READY   UP-TO-DATE   AVAILABLE   AGE
-deployment.apps/game-2048   1/1     1            1           2m9s
+NAME                            DESIRED   CURRENT   UP-TO-DATE   AVAILABLE   AGE
+rollout.argoproj.io/game-2048   1         1         1            1           2m9s
 
 NAME                TYPE       CLUSTER-IP       EXTERNAL-IP   PORT(S)        AGE
 service/game-2048   NodePort   172.20.118.252   <none>        80:31427/TCP   2m9s
@@ -287,9 +287,9 @@ After forking, update the following environment variables to point to your forks
 ```shell
 export TF_VAR_gitops_addons_org=https://github.com/0x1v4n
 export TF_VAR_gitops_addons_repo=eks-addons
-export TF_VAR_gitops_addons_revision=main
+export TF_VAR_gitops_addons_revision=dev
 
 export TF_VAR_gitops_workload_org=https://github.com/0x1v4n
 export TF_VAR_gitops_workload_repo=eks-gitops
-export TF_VAR_gitops_workload_revision=main
+export TF_VAR_gitops_workload_revision=dev
 ```
